@@ -38,7 +38,9 @@ import com.varun.depthai.arcore.BackgroundRenderer
 import com.varun.depthai.arcore.DepthTextureHandler
 import com.varun.depthai.gemini.FrameConverter
 import com.varun.depthai.gemini.GeminiClient
+import com.varun.depthai.gemini.GeminiResponseParser
 import com.varun.depthai.helpers.TapHelper
+import com.varun.depthai.model.ObjectAnalysis
 import com.varun.depthai.ui.theme.DepthAITheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -69,6 +71,10 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
     @Volatile private var pendingScan = false
     @Volatile private var isAnalyzing = false
 
+    // When true, onDrawFrame will not overwrite statusMessage
+    @Volatile private var lockStatus = false
+
+    private var currentAnalysis by mutableStateOf<ObjectAnalysis?>(null)
     private var showDepthMap by mutableStateOf(false)
     private var statusMessage by mutableStateOf("Initializing...")
     private var depthButtonText by mutableStateOf("Show Depth")
@@ -130,6 +136,9 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
                         Button(
                             onClick = {
                                 if (!isAnalyzing) {
+                                    // Reset lock so status updates normally until scan completes
+                                    lockStatus = false
+                                    currentAnalysis = null
                                     pendingScan = true
                                     Log.d(TAG, "Scan button pressed")
                                 }
@@ -276,13 +285,16 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
                 backgroundRenderer.drawDepth(frame)
             }
 
-            runOnUiThread {
-                isTracking = tracking
-                if (!isAnalyzing) {
-                    statusMessage = when {
-                        !isDepthSupported -> "Depth not supported on this device"
-                        !tracking -> "Tracking lost — move slowly"
-                        else -> "Point at object and tap Scan"
+            // Only update status from GL thread if not locked by a completed analysis
+            if (!lockStatus) {
+                runOnUiThread {
+                    isTracking = tracking
+                    if (!isAnalyzing) {
+                        statusMessage = when {
+                            !isDepthSupported -> "Depth not supported on this device"
+                            !tracking -> "Tracking lost — move slowly"
+                            else -> "Point at object and tap Scan"
+                        }
                     }
                 }
             }
@@ -310,17 +322,25 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
                 isAnalyzing = true
                 withContext(Dispatchers.Main) { statusMessage = "Analyzing..." }
 
-                val result = withContext(Dispatchers.IO) {
+                val json = withContext(Dispatchers.IO) {
                     GeminiClient.analyze(base64)
                 }
+
+                val analysis = json?.let { GeminiResponseParser.parse(it) }
 
                 isAnalyzing = false
 
                 withContext(Dispatchers.Main) {
-                    statusMessage = if (result != null) {
-                        "Done — check Logcat"
+                    if (analysis != null) {
+                        currentAnalysis = analysis
+                        // Lock status so GL thread doesn't overwrite it
+                        lockStatus = true
+                        statusMessage = "Found: ${analysis.objectName} (${analysis.level1.size} components)"
+                        Log.d(TAG, "Analysis complete: ${analysis.objectName}")
                     } else {
-                        "Gemini failed — try again"
+                        lockStatus = false
+                        statusMessage = if (json != null) "Parse failed — check Logcat"
+                                        else "Gemini failed — try again"
                     }
                 }
             }
@@ -329,6 +349,7 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
             Log.e(TAG, "Exception during capture: ${e.message}", e)
             runOnUiThread {
                 isAnalyzing = false
+                lockStatus = false
                 statusMessage = "Capture failed — try again"
             }
         }
