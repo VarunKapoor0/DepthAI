@@ -9,8 +9,11 @@ import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
@@ -23,23 +26,17 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
-import com.google.ar.core.Anchor
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Camera
 import com.google.ar.core.Config
 import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
-import com.google.ar.core.Plane
-import com.google.ar.core.Point
-import com.google.ar.core.Point.OrientationMode
-import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.varun.depthai.arcore.BackgroundRenderer
 import com.varun.depthai.arcore.DepthTextureHandler
-import com.varun.depthai.arcore.ObjectRenderer
-import com.varun.depthai.arcore.OcclusionObjectRenderer
+import com.varun.depthai.gemini.FrameConverter
 import com.varun.depthai.helpers.TapHelper
 import com.varun.depthai.ui.theme.DepthAITheme
 import javax.microedition.khronos.egl.EGLConfig
@@ -49,7 +46,6 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
 
     companion object {
         private const val TAG = "MainActivity"
-        private val OBJECT_COLOR = floatArrayOf(139.0f, 195.0f, 74.0f, 255.0f)
     }
 
     private lateinit var surfaceView: GLSurfaceView
@@ -65,15 +61,14 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
 
     private val backgroundRenderer = BackgroundRenderer()
     private val depthTextureHandler = DepthTextureHandler()
-    private val virtualObject = ObjectRenderer()
-    private val occludedVirtualObject = OcclusionObjectRenderer()
 
-    private val anchorMatrix = FloatArray(16)
-    private val anchors = ArrayList<Anchor>()
+    @Volatile private var pendingScan = false
+    @Volatile private var lastCapturedBase64: String? = null
 
     private var showDepthMap by mutableStateOf(false)
     private var statusMessage by mutableStateOf("Initializing...")
     private var depthButtonText by mutableStateOf("Show Depth")
+    private var isTracking by mutableStateOf(false)
 
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
@@ -104,7 +99,6 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
             DepthAITheme {
                 Box(modifier = Modifier.fillMaxSize()) {
 
-                    // Status message top center
                     Text(
                         text = statusMessage,
                         color = Color.White,
@@ -113,21 +107,30 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
                             .padding(top = 16.dp)
                     )
 
-                    // Depth toggle button top right
-                    Button(
-                        onClick = {
+                    Row(
+                        modifier = Modifier
+                            .align(Alignment.BottomCenter)
+                            .fillMaxWidth()
+                            .padding(16.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Button(onClick = {
                             if (isDepthSupported) {
                                 showDepthMap = !showDepthMap
                                 depthButtonText = if (showDepthMap) "Hide Depth" else "Show Depth"
-                            } else {
-                                depthButtonText = "Depth N/A"
                             }
-                        },
-                        modifier = Modifier
-                            .align(Alignment.TopEnd)
-                            .padding(top = 8.dp, end = 8.dp)
-                    ) {
-                        Text(depthButtonText)
+                        }) {
+                            Text(depthButtonText)
+                        }
+
+                        // Scan button — no condition, always pressable
+                        // GL thread checks tracking state before capturing
+                        Button(onClick = {
+                            pendingScan = true
+                            Log.d(TAG, "Scan button pressed, pendingScan = true")
+                        }) {
+                            Text("Scan")
+                        }
                     }
                 }
             }
@@ -166,7 +169,7 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
                 val config = session!!.config
                 isDepthSupported = session!!.isDepthModeSupported(Config.DepthMode.AUTOMATIC)
                 config.depthMode = if (isDepthSupported) Config.DepthMode.AUTOMATIC
-                                   else Config.DepthMode.DISABLED
+                else Config.DepthMode.DISABLED
                 session!!.configure(config)
 
             } catch (e: Exception) {
@@ -211,10 +214,6 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
         try {
             depthTextureHandler.createOnGLThread()
             backgroundRenderer.createOnGlThread(this)
-            virtualObject.createOnGlThread(this, "models/andy.obj", "models/andy.png")
-            virtualObject.setMaterialProperties(0.0f, 2.0f, 0.5f, 6.0f)
-            occludedVirtualObject.createOnGlThread(this, "models/andy.obj", "models/andy.png")
-            occludedVirtualObject.setMaterialProperties(0.0f, 2.0f, 0.5f, 6.0f)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to initialize renderers", e)
         }
@@ -250,23 +249,22 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
 
             if (isDepthSupported) {
                 depthTextureHandler.update(frame)
-                if (depthShadersCreated) {
-                    occludedVirtualObject.setDepthTexture(
-                        depthTextureHandler.depthTextureId,
-                        depthTextureHandler.depthWidth,
-                        depthTextureHandler.depthHeight
-                    )
-                }
             }
 
             val camera: Camera = frame.camera
+            val tracking = camera.trackingState == TrackingState.TRACKING
 
-            if (frame.hasDisplayGeometryChanged()) {
-                val uvTransform = getTextureTransformMatrix(frame)
-                occludedVirtualObject.setUvTransformMatrix(uvTransform)
+            // Check pendingScan regardless of tracking — log both cases
+            if (pendingScan) {
+                pendingScan = false
+                Log.d(TAG, "Processing scan request. Tracking: $tracking")
+                if (tracking) {
+                    captureFrame(frame)
+                } else {
+                    Log.w(TAG, "Scan requested but not tracking yet")
+                    runOnUiThread { statusMessage = "Not tracking yet — try again" }
+                }
             }
-
-            handleTap(frame, camera)
 
             backgroundRenderer.draw(frame)
 
@@ -274,40 +272,12 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
                 backgroundRenderer.drawDepth(frame)
             }
 
-            if (camera.trackingState == TrackingState.PAUSED) {
-                runOnUiThread { statusMessage = "Tracking lost — move slowly" }
-                return
-            }
-
-            val projmtx = FloatArray(16)
-            camera.getProjectionMatrix(projmtx, 0, 0.1f, 100.0f)
-
-            val viewmtx = FloatArray(16)
-            camera.getViewMatrix(viewmtx, 0)
-
-            val colorCorrectionRgba = FloatArray(4)
-            frame.getLightEstimate().getColorCorrection(colorCorrectionRgba, 0)
-
-            for (anchor in anchors) {
-                if (anchor.trackingState != TrackingState.TRACKING) continue
-                anchor.pose.toMatrix(anchorMatrix, 0)
-
-                if (isDepthSupported && depthShadersCreated) {
-                    occludedVirtualObject.updateModelMatrix(anchorMatrix, 1.0f)
-                    occludedVirtualObject.draw(viewmtx, projmtx, colorCorrectionRgba, OBJECT_COLOR)
-                } else {
-                    virtualObject.updateModelMatrix(anchorMatrix, 1.0f)
-                    virtualObject.draw(viewmtx, projmtx, colorCorrectionRgba, OBJECT_COLOR)
-                }
-            }
-
-            val hasPlane = hasTrackingPlane()
             runOnUiThread {
+                isTracking = tracking
                 statusMessage = when {
                     !isDepthSupported -> "Depth not supported on this device"
-                    camera.trackingState == TrackingState.TRACKING && hasPlane -> "Tap to place Andy"
-                    camera.trackingState == TrackingState.TRACKING -> "Move slowly to detect surfaces"
-                    else -> "Initializing..."
+                    !tracking -> "Tracking lost — move slowly"
+                    else -> "Point at object and tap Scan"
                 }
             }
 
@@ -316,66 +286,26 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
         }
     }
 
-    private fun handleTap(frame: Frame, camera: Camera) {
-        val tap = tapHelper.poll() ?: return
-        if (camera.trackingState != TrackingState.TRACKING) return
+    private fun captureFrame(frame: Frame) {
+        try {
+            Log.d(TAG, "Acquiring camera image...")
+            val cameraImage = frame.acquireCameraImage()
+            Log.d(TAG, "Camera image acquired: ${cameraImage.width}x${cameraImage.height}")
+            val base64 = FrameConverter.toBase64Jpeg(cameraImage)
+            cameraImage.close()
 
-        for (hit in frame.hitTest(tap)) {
-            val trackable = hit.trackable
-            if ((trackable is Plane
-                        && trackable.isPoseInPolygon(hit.hitPose)
-                        && calculateDistanceToPlane(hit.hitPose, camera.pose) > 0)
-                || (trackable is Point
-                        && trackable.orientationMode == OrientationMode.ESTIMATED_SURFACE_NORMAL)
-            ) {
-                if (anchors.size >= 20) {
-                    anchors[0].detach()
-                    anchors.removeAt(0)
-                }
-                anchors.add(hit.createAnchor())
-                break
+            if (base64 != null) {
+                Log.d(TAG, "Frame captured successfully. Base64 length: ${base64.length}")
+                Log.d(TAG, "Base64 preview: ${base64.take(100)}...")
+                lastCapturedBase64 = base64
+                runOnUiThread { statusMessage = "Frame captured — ready for Gemini" }
+            } else {
+                Log.e(TAG, "FrameConverter returned null")
+                runOnUiThread { statusMessage = "Capture failed — try again" }
             }
+        } catch (e: Exception) {
+            Log.e(TAG, "Exception during frame capture: ${e.message}", e)
+            runOnUiThread { statusMessage = "Capture failed: ${e.message}" }
         }
-    }
-
-    private fun hasTrackingPlane(): Boolean {
-        val currentSession = session ?: return false
-        return currentSession.getAllTrackables(Plane::class.java)
-            .any { it.trackingState == TrackingState.TRACKING }
-    }
-
-    private fun calculateDistanceToPlane(planePose: Pose, cameraPose: Pose): Float {
-        val normal = FloatArray(3)
-        planePose.getTransformedAxis(1, 1.0f, normal, 0)
-        return ((cameraPose.tx() - planePose.tx()) * normal[0]
-                + (cameraPose.ty() - planePose.ty()) * normal[1]
-                + (cameraPose.tz() - planePose.tz()) * normal[2])
-    }
-
-    private fun getTextureTransformMatrix(frame: Frame): FloatArray {
-        val frameTransform = FloatArray(6)
-        val uvTransform = FloatArray(9)
-        val ndcBasis = floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f)
-
-        frame.transformCoordinates2d(
-            Coordinates2d.OPENGL_NORMALIZED_DEVICE_COORDINATES,
-            ndcBasis,
-            Coordinates2d.TEXTURE_NORMALIZED,
-            frameTransform
-        )
-
-        val ndcOriginX = frameTransform[0]
-        val ndcOriginY = frameTransform[1]
-        uvTransform[0] = frameTransform[2] - ndcOriginX
-        uvTransform[1] = frameTransform[3] - ndcOriginY
-        uvTransform[2] = 0f
-        uvTransform[3] = frameTransform[4] - ndcOriginX
-        uvTransform[4] = frameTransform[5] - ndcOriginY
-        uvTransform[5] = 0f
-        uvTransform[6] = ndcOriginX
-        uvTransform[7] = ndcOriginY
-        uvTransform[8] = 1f
-
-        return uvTransform
     }
 }
