@@ -26,10 +26,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.Camera
 import com.google.ar.core.Config
-import com.google.ar.core.Coordinates2d
 import com.google.ar.core.Frame
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
@@ -37,8 +37,12 @@ import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.varun.depthai.arcore.BackgroundRenderer
 import com.varun.depthai.arcore.DepthTextureHandler
 import com.varun.depthai.gemini.FrameConverter
+import com.varun.depthai.gemini.GeminiClient
 import com.varun.depthai.helpers.TapHelper
 import com.varun.depthai.ui.theme.DepthAITheme
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 
@@ -63,7 +67,7 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
     private val depthTextureHandler = DepthTextureHandler()
 
     @Volatile private var pendingScan = false
-    @Volatile private var lastCapturedBase64: String? = null
+    @Volatile private var isAnalyzing = false
 
     private var showDepthMap by mutableStateOf(false)
     private var statusMessage by mutableStateOf("Initializing...")
@@ -123,13 +127,16 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
                             Text(depthButtonText)
                         }
 
-                        // Scan button — no condition, always pressable
-                        // GL thread checks tracking state before capturing
-                        Button(onClick = {
-                            pendingScan = true
-                            Log.d(TAG, "Scan button pressed, pendingScan = true")
-                        }) {
-                            Text("Scan")
+                        Button(
+                            onClick = {
+                                if (!isAnalyzing) {
+                                    pendingScan = true
+                                    Log.d(TAG, "Scan button pressed")
+                                }
+                            },
+                            enabled = !isAnalyzing
+                        ) {
+                            Text(if (isAnalyzing) "Analyzing..." else "Scan")
                         }
                     }
                 }
@@ -254,14 +261,11 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
             val camera: Camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
 
-            // Check pendingScan regardless of tracking — log both cases
-            if (pendingScan) {
+            if (pendingScan && !isAnalyzing) {
                 pendingScan = false
-                Log.d(TAG, "Processing scan request. Tracking: $tracking")
                 if (tracking) {
-                    captureFrame(frame)
+                    captureAndAnalyze(frame)
                 } else {
-                    Log.w(TAG, "Scan requested but not tracking yet")
                     runOnUiThread { statusMessage = "Not tracking yet — try again" }
                 }
             }
@@ -274,10 +278,12 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
 
             runOnUiThread {
                 isTracking = tracking
-                statusMessage = when {
-                    !isDepthSupported -> "Depth not supported on this device"
-                    !tracking -> "Tracking lost — move slowly"
-                    else -> "Point at object and tap Scan"
+                if (!isAnalyzing) {
+                    statusMessage = when {
+                        !isDepthSupported -> "Depth not supported on this device"
+                        !tracking -> "Tracking lost — move slowly"
+                        else -> "Point at object and tap Scan"
+                    }
                 }
             }
 
@@ -286,26 +292,45 @@ class MainActivity : ComponentActivity(), GLSurfaceView.Renderer {
         }
     }
 
-    private fun captureFrame(frame: Frame) {
+    private fun captureAndAnalyze(frame: Frame) {
         try {
-            Log.d(TAG, "Acquiring camera image...")
             val cameraImage = frame.acquireCameraImage()
-            Log.d(TAG, "Camera image acquired: ${cameraImage.width}x${cameraImage.height}")
             val base64 = FrameConverter.toBase64Jpeg(cameraImage)
             cameraImage.close()
 
-            if (base64 != null) {
-                Log.d(TAG, "Frame captured successfully. Base64 length: ${base64.length}")
-                Log.d(TAG, "Base64 preview: ${base64.take(100)}...")
-                lastCapturedBase64 = base64
-                runOnUiThread { statusMessage = "Frame captured — ready for Gemini" }
-            } else {
-                Log.e(TAG, "FrameConverter returned null")
+            if (base64 == null) {
+                Log.e(TAG, "Frame capture returned null")
                 runOnUiThread { statusMessage = "Capture failed — try again" }
+                return
             }
+
+            Log.d(TAG, "Frame captured: ${base64.length} chars. Sending to Gemini...")
+
+            lifecycleScope.launch {
+                isAnalyzing = true
+                withContext(Dispatchers.Main) { statusMessage = "Analyzing..." }
+
+                val result = withContext(Dispatchers.IO) {
+                    GeminiClient.analyze(base64)
+                }
+
+                isAnalyzing = false
+
+                withContext(Dispatchers.Main) {
+                    statusMessage = if (result != null) {
+                        "Done — check Logcat"
+                    } else {
+                        "Gemini failed — try again"
+                    }
+                }
+            }
+
         } catch (e: Exception) {
-            Log.e(TAG, "Exception during frame capture: ${e.message}", e)
-            runOnUiThread { statusMessage = "Capture failed: ${e.message}" }
+            Log.e(TAG, "Exception during capture: ${e.message}", e)
+            runOnUiThread {
+                isAnalyzing = false
+                statusMessage = "Capture failed — try again"
+            }
         }
     }
 }
